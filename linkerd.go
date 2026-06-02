@@ -14,11 +14,33 @@ import (
 
 const linkerdEgressNetworkName = "all-egress"
 
-// buildLinkerd installs cert-manager + linkerd and the egress network, mirroring
-// linkerd.tf. Gated by enable_linkerd in the caller.
+// linkerdCerts holds the mTLS material wired into the linkerd control plane.
+type linkerdCerts struct {
+	anchorCert *tls.SelfSignedCert
+	issuerCert *tls.LocallySignedCert
+	issuerKey  *tls.PrivateKey
+}
+
+// buildLinkerd installs cert-manager, the linkerd service mesh, and the egress
+// network, mirroring linkerd.tf. Gated by enable_linkerd in the caller.
 func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster) error {
 	clusterDeps := pulumi.DependsOn([]pulumi.Resource{gke.cluster, gke.nodePool})
 
+	if err := buildCertManager(ctx, prov, clusterDeps); err != nil {
+		return err
+	}
+
+	certs, err := buildLinkerdCerts(ctx)
+	if err != nil {
+		return err
+	}
+
+	return installLinkerdMesh(ctx, prov, clusterDeps, certs)
+}
+
+// buildCertManager installs cert-manager and the self-signed public-issuer
+// chain used by the ingress/tunnel Certificate resources.
+func buildCertManager(ctx *pulumi.Context, prov *kubernetes.Provider, clusterDeps pulumi.ResourceOption) error {
 	certManager, err := helm.NewRelease(ctx, "cert-manager", &helm.ReleaseArgs{
 		Name:            pulumi.String("cert-manager"),
 		Chart:           pulumi.String("cert-manager"),
@@ -26,9 +48,7 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 		Namespace:       pulumi.String("cert-manager"),
 		CreateNamespace: pulumi.Bool(true),
 		WaitForJobs:     pulumi.Bool(true),
-		RepositoryOpts: &helm.RepositoryOptsArgs{
-			Repo: pulumi.String("https://charts.jetstack.io"),
-		},
+		RepositoryOpts:  &helm.RepositoryOptsArgs{Repo: pulumi.String("https://charts.jetstack.io")},
 		Values: pulumi.Map{
 			"crds": pulumi.Map{"enabled": pulumi.Bool(true)},
 			"startupapicheck": pulumi.Map{
@@ -41,16 +61,11 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 		return fmt.Errorf("cert-manager release: %w", err)
 	}
 
-	bootstrapIssuer, err := apiextensions.NewCustomResource(ctx, "selfsigned-bootstrap", &apiextensions.CustomResourceArgs{
-		ApiVersion: pulumi.String("cert-manager.io/v1"),
-		Kind:       pulumi.String("ClusterIssuer"),
-		Metadata:   &metav1.ObjectMetaArgs{Name: pulumi.String("selfsigned-bootstrap")},
-		OtherFields: kubernetes.UntypedArgs{
-			"spec": map[string]interface{}{"selfSigned": map[string]interface{}{}},
-		},
-	}, pulumi.Provider(prov), pulumi.DependsOn([]pulumi.Resource{certManager}))
+	bootstrapIssuer, err := clusterIssuer(ctx, prov, "selfsigned-bootstrap", map[string]interface{}{
+		"selfSigned": map[string]interface{}{},
+	}, certManager)
 	if err != nil {
-		return fmt.Errorf("bootstrap issuer: %w", err)
+		return err
 	}
 
 	caCert, err := apiextensions.NewCustomResource(ctx, "public-issuer-ca", &apiextensions.CustomResourceArgs{
@@ -65,10 +80,7 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 				"isCA":       true,
 				"commonName": "public-issuer",
 				"secretName": "public-issuer-ca-tls",
-				"issuerRef": map[string]interface{}{
-					"name": "selfsigned-bootstrap",
-					"kind": "ClusterIssuer",
-				},
+				"issuerRef":  map[string]interface{}{"name": "selfsigned-bootstrap", "kind": "ClusterIssuer"},
 				"privateKey": map[string]interface{}{"algorithm": "ECDSA", "size": 256},
 			},
 		},
@@ -77,40 +89,48 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 		return fmt.Errorf("public issuer ca cert: %w", err)
 	}
 
-	_, err = apiextensions.NewCustomResource(ctx, "public-issuer", &apiextensions.CustomResourceArgs{
-		ApiVersion: pulumi.String("cert-manager.io/v1"),
-		Kind:       pulumi.String("ClusterIssuer"),
-		Metadata:   &metav1.ObjectMetaArgs{Name: pulumi.String("public-issuer")},
-		OtherFields: kubernetes.UntypedArgs{
-			"spec": map[string]interface{}{
-				"ca": map[string]interface{}{"secretName": "public-issuer-ca-tls"},
-			},
-		},
-	}, pulumi.Provider(prov), pulumi.DependsOn([]pulumi.Resource{caCert}))
-	if err != nil {
-		return fmt.Errorf("public issuer: %w", err)
+	if _, err := clusterIssuer(ctx, prov, "public-issuer", map[string]interface{}{
+		"ca": map[string]interface{}{"secretName": "public-issuer-ca-tls"},
+	}, caCert); err != nil {
+		return err
 	}
+	return nil
+}
 
-	// Linkerd mTLS certs via pulumi-tls so they stay stable in state across runs.
+// clusterIssuer creates a cert-manager ClusterIssuer with the given spec.
+func clusterIssuer(ctx *pulumi.Context, prov *kubernetes.Provider, name string, spec map[string]interface{}, dep pulumi.Resource) (*apiextensions.CustomResource, error) {
+	cr, err := apiextensions.NewCustomResource(ctx, name, &apiextensions.CustomResourceArgs{
+		ApiVersion:  pulumi.String("cert-manager.io/v1"),
+		Kind:        pulumi.String("ClusterIssuer"),
+		Metadata:    &metav1.ObjectMetaArgs{Name: pulumi.String(name)},
+		OtherFields: kubernetes.UntypedArgs{"spec": spec},
+	}, pulumi.Provider(prov), pulumi.DependsOn([]pulumi.Resource{dep}))
+	if err != nil {
+		return nil, fmt.Errorf("cluster issuer %q: %w", name, err)
+	}
+	return cr, nil
+}
+
+// buildLinkerdCerts generates the linkerd trust anchor (10y root) and issuer
+// (1y intermediate) via pulumi-tls so the material stays stable in state.
+func buildLinkerdCerts(ctx *pulumi.Context) (linkerdCerts, error) {
 	anchorKey, err := tls.NewPrivateKey(ctx, "linkerd-trust-anchor", &tls.PrivateKeyArgs{
 		Algorithm:  pulumi.String("ECDSA"),
 		EcdsaCurve: pulumi.String("P256"),
 	})
 	if err != nil {
-		return fmt.Errorf("linkerd trust anchor key: %w", err)
+		return linkerdCerts{}, fmt.Errorf("linkerd trust anchor key: %w", err)
 	}
 
 	anchorCert, err := tls.NewSelfSignedCert(ctx, "linkerd-trust-anchor", &tls.SelfSignedCertArgs{
-		PrivateKeyPem:   anchorKey.PrivateKeyPem,
-		IsCaCertificate: pulumi.Bool(true),
-		Subject: &tls.SelfSignedCertSubjectArgs{
-			CommonName: pulumi.String("root.linkerd.cluster.local"),
-		},
+		PrivateKeyPem:       anchorKey.PrivateKeyPem,
+		IsCaCertificate:     pulumi.Bool(true),
+		Subject:             &tls.SelfSignedCertSubjectArgs{CommonName: pulumi.String("root.linkerd.cluster.local")},
 		ValidityPeriodHours: pulumi.Int(87600),
 		AllowedUses:         pulumi.StringArray{pulumi.String("cert_signing"), pulumi.String("crl_signing")},
 	})
 	if err != nil {
-		return fmt.Errorf("linkerd trust anchor cert: %w", err)
+		return linkerdCerts{}, fmt.Errorf("linkerd trust anchor cert: %w", err)
 	}
 
 	issuerKey, err := tls.NewPrivateKey(ctx, "linkerd-issuer", &tls.PrivateKeyArgs{
@@ -118,17 +138,15 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 		EcdsaCurve: pulumi.String("P256"),
 	})
 	if err != nil {
-		return fmt.Errorf("linkerd issuer key: %w", err)
+		return linkerdCerts{}, fmt.Errorf("linkerd issuer key: %w", err)
 	}
 
 	issuerReq, err := tls.NewCertRequest(ctx, "linkerd-issuer", &tls.CertRequestArgs{
 		PrivateKeyPem: issuerKey.PrivateKeyPem,
-		Subject: &tls.CertRequestSubjectArgs{
-			CommonName: pulumi.String("identity.linkerd.cluster.local"),
-		},
+		Subject:       &tls.CertRequestSubjectArgs{CommonName: pulumi.String("identity.linkerd.cluster.local")},
 	})
 	if err != nil {
-		return fmt.Errorf("linkerd issuer cert request: %w", err)
+		return linkerdCerts{}, fmt.Errorf("linkerd issuer cert request: %w", err)
 	}
 
 	issuerCert, err := tls.NewLocallySignedCert(ctx, "linkerd-issuer", &tls.LocallySignedCertArgs{
@@ -140,41 +158,42 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 		AllowedUses:         pulumi.StringArray{pulumi.String("cert_signing")},
 	})
 	if err != nil {
-		return fmt.Errorf("linkerd issuer cert: %w", err)
+		return linkerdCerts{}, fmt.Errorf("linkerd issuer cert: %w", err)
 	}
 
+	return linkerdCerts{anchorCert: anchorCert, issuerCert: issuerCert, issuerKey: issuerKey}, nil
+}
+
+// installLinkerdMesh installs the linkerd CRDs + control plane (wired to the
+// generated certs) and the egress network that the tunnel component routes
+// outbound traffic through.
+func installLinkerdMesh(ctx *pulumi.Context, prov *kubernetes.Provider, clusterDeps pulumi.ResourceOption, certs linkerdCerts) error {
 	linkerdCRDs, err := helm.NewRelease(ctx, "linkerd-crds", &helm.ReleaseArgs{
 		Name:            pulumi.String("linkerd-crds"),
 		Chart:           pulumi.String("linkerd-crds"),
 		Version:         pulumi.String("2026.2.1"),
 		Namespace:       pulumi.String("linkerd"),
 		CreateNamespace: pulumi.Bool(true),
-		RepositoryOpts: &helm.RepositoryOptsArgs{
-			Repo: pulumi.String("https://helm.linkerd.io/edge"),
-		},
-		Values: pulumi.Map{
-			"installGatewayAPI": pulumi.Bool(false),
-		},
+		RepositoryOpts:  &helm.RepositoryOptsArgs{Repo: pulumi.String("https://helm.linkerd.io/edge")},
+		Values:          pulumi.Map{"installGatewayAPI": pulumi.Bool(false)},
 	}, pulumi.Provider(prov), clusterDeps)
 	if err != nil {
 		return fmt.Errorf("linkerd-crds release: %w", err)
 	}
 
 	controlPlane, err := helm.NewRelease(ctx, "linkerd-control-plane", &helm.ReleaseArgs{
-		Name:      pulumi.String("linkerd-control-plane"),
-		Chart:     pulumi.String("linkerd-control-plane"),
-		Version:   pulumi.String("2026.2.1"),
-		Namespace: pulumi.String("linkerd"),
-		RepositoryOpts: &helm.RepositoryOptsArgs{
-			Repo: pulumi.String("https://helm.linkerd.io/edge"),
-		},
+		Name:           pulumi.String("linkerd-control-plane"),
+		Chart:          pulumi.String("linkerd-control-plane"),
+		Version:        pulumi.String("2026.2.1"),
+		Namespace:      pulumi.String("linkerd"),
+		RepositoryOpts: &helm.RepositoryOptsArgs{Repo: pulumi.String("https://helm.linkerd.io/edge")},
 		Values: pulumi.Map{
-			"identityTrustAnchorsPEM": anchorCert.CertPem,
+			"identityTrustAnchorsPEM": certs.anchorCert.CertPem,
 			"identity": pulumi.Map{
 				"issuer": pulumi.Map{
 					"tls": pulumi.Map{
-						"crtPEM": issuerCert.CertPem,
-						"keyPEM": issuerKey.PrivateKeyPem,
+						"crtPEM": certs.issuerCert.CertPem,
+						"keyPEM": certs.issuerKey.PrivateKeyPem,
 					},
 				},
 			},
@@ -186,10 +205,8 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 
 	egressNS, err := corev1.NewNamespace(ctx, "linkerd-egress", &corev1.NamespaceArgs{
 		Metadata: &metav1.ObjectMetaArgs{
-			Name: pulumi.String("linkerd-egress"),
-			Annotations: pulumi.StringMap{
-				"linkerd.io/inject": pulumi.String("enabled"),
-			},
+			Name:        pulumi.String("linkerd-egress"),
+			Annotations: pulumi.StringMap{"linkerd.io/inject": pulumi.String("enabled")},
 		},
 	}, pulumi.Provider(prov), pulumi.DependsOn([]pulumi.Resource{controlPlane}))
 	if err != nil {
@@ -208,12 +225,8 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 				"trafficPolicy": "Allow",
 				"networks": []interface{}{
 					map[string]interface{}{
-						"cidr": "0.0.0.0/0",
-						"except": []interface{}{
-							"10.0.0.0/8",
-							"172.16.0.0/12",
-							"192.168.0.0/16",
-						},
+						"cidr":   "0.0.0.0/0",
+						"except": []interface{}{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"},
 					},
 				},
 			},
@@ -222,6 +235,5 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 	if err != nil {
 		return fmt.Errorf("egress network: %w", err)
 	}
-
 	return nil
 }
