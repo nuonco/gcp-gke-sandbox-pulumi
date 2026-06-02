@@ -1,0 +1,70 @@
+name: gcp-gke-sandbox-pulumi
+runtime: go
+description: GCP GKE sandbox managed by Pulumi (port of gcp-gke-sandbox)
+config:
+  nuon:nuon_id:
+    description: Install id used to namespace resources
+  nuon:project_id:
+    description: GCP project id
+  nuon:region:
+    description: GCP region
+  nuon:cluster_name:
+    description: GKE cluster name. Defaults to n-{nuon_id}
+    default: ""
+  nuon:node_machine_type:
+    description: Machine type for the default node pool
+    default: e2-standard-4
+  nuon:node_min_count:
+    description: Minimum node count per zone for autoscaling
+    default: 1
+  nuon:node_max_count:
+    description: Maximum node count per zone for autoscaling
+    default: 10
+  nuon:release_channel:
+    description: "GKE release channel: RAPID, REGULAR, STABLE"
+    default: REGULAR
+  nuon:deletion_protection:
+    description: Enable deletion protection on the cluster
+    default: false
+  nuon:cluster_endpoint_public_access:
+    description: Whether the GKE control plane endpoint is publicly accessible
+    default: true
+  nuon:network:
+    description: Existing VPC network name. Empty creates a new VPC
+    default: ""
+  nuon:subnetwork:
+    description: Existing subnetwork name. Used only with an existing network
+    default: ""
+  nuon:subnet_cidr:
+    description: Primary CIDR for the GKE subnet (when creating a new VPC)
+    default: 10.0.0.0/20
+  nuon:pods_cidr_range:
+    description: Secondary CIDR range for pods
+    default: 10.1.0.0/16
+  nuon:services_cidr_range:
+    description: Secondary CIDR range for services
+    default: 10.2.0.0/20
+  nuon:enable_nuon_dns:
+    description: When "true" or "1", create Cloud DNS zones
+    default: "false"
+  nuon:public_root_domain:
+    description: Public root domain for Cloud DNS
+    default: ""
+  nuon:internal_root_domain:
+    description: Internal root domain for Cloud DNS
+    default: ""
+  nuon:enable_linkerd:
+    description: Install cert-manager and Linkerd service mesh
+    default: true
+  nuon:additional_namespaces:
+    description: Extra namespaces to create (the nuon_id namespace is always created)
+    default: "[]"
+  nuon:master_authorized_networks:
+    description: CIDR blocks authorized to access the GKE control plane
+    default: "[]"
+  nuon:labels:
+    description: Labels to apply to all resources
+    default: "{}"
+  nuon:tags:
+    description: Tags provided by Nuon for resource identification
+    default: "{}"
