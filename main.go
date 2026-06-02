@@ -29,7 +29,7 @@ func main() {
 			return err
 		}
 
-		repo, err := artifactregistry.NewRepository(ctx, "main", &artifactregistry.RepositoryArgs{
+		repo, err := artifactregistry.NewRepository(ctx, "registry", &artifactregistry.RepositoryArgs{
 			Project:      pulumi.String(c.projectID),
 			Location:     pulumi.String(c.region),
 			RepositoryId: pulumi.String(clusterName),

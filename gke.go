@@ -62,12 +62,12 @@ func buildGKE(ctx *pulumi.Context, c nuonConfig, clusterName string, vpc vpcLaye
 		}
 	}
 
-	cluster, err := container.NewCluster(ctx, "main", clusterArgs)
+	cluster, err := container.NewCluster(ctx, "cluster", clusterArgs)
 	if err != nil {
 		return gkeCluster{}, fmt.Errorf("create gke cluster: %w", err)
 	}
 
-	nodePool, err := container.NewNodePool(ctx, "main", &container.NodePoolArgs{
+	nodePool, err := container.NewNodePool(ctx, "node-pool", &container.NodePoolArgs{
 		Project:  pulumi.String(c.projectID),
 		Name:     pulumi.String("main"),
 		Cluster:  cluster.Name,

@@ -29,7 +29,7 @@ func buildVPC(ctx *pulumi.Context, c nuonConfig, clusterName string) (vpcLayer, 
 		}, nil
 	}
 
-	net, err := compute.NewNetwork(ctx, "main", &compute.NetworkArgs{
+	net, err := compute.NewNetwork(ctx, "vpc", &compute.NetworkArgs{
 		Project:               pulumi.String(c.projectID),
 		Name:                  pulumi.Sprintf("%s-vpc", clusterName),
 		AutoCreateSubnetworks: pulumi.Bool(false),
@@ -60,7 +60,7 @@ func buildVPC(ctx *pulumi.Context, c nuonConfig, clusterName string) (vpcLayer, 
 		return vpcLayer{}, fmt.Errorf("create subnet: %w", err)
 	}
 
-	router, err := compute.NewRouter(ctx, "main", &compute.RouterArgs{
+	router, err := compute.NewRouter(ctx, "router", &compute.RouterArgs{
 		Project: pulumi.String(c.projectID),
 		Name:    pulumi.Sprintf("%s-router", clusterName),
 		Region:  pulumi.String(c.region),
@@ -70,7 +70,7 @@ func buildVPC(ctx *pulumi.Context, c nuonConfig, clusterName string) (vpcLayer, 
 		return vpcLayer{}, fmt.Errorf("create router: %w", err)
 	}
 
-	_, err = compute.NewRouterNat(ctx, "main", &compute.RouterNatArgs{
+	_, err = compute.NewRouterNat(ctx, "nat", &compute.RouterNatArgs{
 		Project:                       pulumi.String(c.projectID),
 		Name:                          pulumi.Sprintf("%s-nat", clusterName),
 		Router:                        router.Name,
