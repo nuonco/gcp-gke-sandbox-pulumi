@@ -5,6 +5,7 @@ go 1.22
 require (
 	github.com/pulumi/pulumi-gcp/sdk/v8 v8.12.0
 	github.com/pulumi/pulumi-kubernetes/sdk/v4 v4.18.3
+	github.com/pulumi/pulumi-tls/sdk/v5 v5.0.5
 	github.com/pulumi/pulumi/sdk/v3 v3.145.0
 )
 

@@ -8,6 +8,7 @@ import (
 	corev1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/core/v1"
 	helm "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/helm/v3"
 	metav1 "github.com/pulumi/pulumi-kubernetes/sdk/v4/go/kubernetes/meta/v1"
+	"github.com/pulumi/pulumi-tls/sdk/v5/go/tls"
 	"github.com/pulumi/pulumi/sdk/v3/go/pulumi"
 )
 
@@ -90,9 +91,56 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 		return fmt.Errorf("public issuer: %w", err)
 	}
 
-	certs, err := generateLinkerdCerts()
+	// Linkerd mTLS certs via pulumi-tls so they stay stable in state across runs.
+	anchorKey, err := tls.NewPrivateKey(ctx, "linkerd-trust-anchor", &tls.PrivateKeyArgs{
+		Algorithm:  pulumi.String("ECDSA"),
+		EcdsaCurve: pulumi.String("P256"),
+	})
 	if err != nil {
-		return fmt.Errorf("generate linkerd certs: %w", err)
+		return fmt.Errorf("linkerd trust anchor key: %w", err)
+	}
+
+	anchorCert, err := tls.NewSelfSignedCert(ctx, "linkerd-trust-anchor", &tls.SelfSignedCertArgs{
+		PrivateKeyPem:   anchorKey.PrivateKeyPem,
+		IsCaCertificate: pulumi.Bool(true),
+		Subject: &tls.SelfSignedCertSubjectArgs{
+			CommonName: pulumi.String("root.linkerd.cluster.local"),
+		},
+		ValidityPeriodHours: pulumi.Int(87600),
+		AllowedUses:         pulumi.StringArray{pulumi.String("cert_signing"), pulumi.String("crl_signing")},
+	})
+	if err != nil {
+		return fmt.Errorf("linkerd trust anchor cert: %w", err)
+	}
+
+	issuerKey, err := tls.NewPrivateKey(ctx, "linkerd-issuer", &tls.PrivateKeyArgs{
+		Algorithm:  pulumi.String("ECDSA"),
+		EcdsaCurve: pulumi.String("P256"),
+	})
+	if err != nil {
+		return fmt.Errorf("linkerd issuer key: %w", err)
+	}
+
+	issuerReq, err := tls.NewCertRequest(ctx, "linkerd-issuer", &tls.CertRequestArgs{
+		PrivateKeyPem: issuerKey.PrivateKeyPem,
+		Subject: &tls.CertRequestSubjectArgs{
+			CommonName: pulumi.String("identity.linkerd.cluster.local"),
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("linkerd issuer cert request: %w", err)
+	}
+
+	issuerCert, err := tls.NewLocallySignedCert(ctx, "linkerd-issuer", &tls.LocallySignedCertArgs{
+		CertRequestPem:      issuerReq.CertRequestPem,
+		CaPrivateKeyPem:     anchorKey.PrivateKeyPem,
+		CaCertPem:           anchorCert.CertPem,
+		IsCaCertificate:     pulumi.Bool(true),
+		ValidityPeriodHours: pulumi.Int(8760),
+		AllowedUses:         pulumi.StringArray{pulumi.String("cert_signing")},
+	})
+	if err != nil {
+		return fmt.Errorf("linkerd issuer cert: %w", err)
 	}
 
 	linkerdCRDs, err := helm.NewRelease(ctx, "linkerd-crds", &helm.ReleaseArgs{
@@ -121,12 +169,12 @@ func buildLinkerd(ctx *pulumi.Context, prov *kubernetes.Provider, gke gkeCluster
 			Repo: pulumi.String("https://helm.linkerd.io/edge"),
 		},
 		Values: pulumi.Map{
-			"identityTrustAnchorsPEM": pulumi.String(certs.trustAnchorPEM),
+			"identityTrustAnchorsPEM": anchorCert.CertPem,
 			"identity": pulumi.Map{
 				"issuer": pulumi.Map{
 					"tls": pulumi.Map{
-						"crtPEM": pulumi.String(certs.issuerCertPEM),
-						"keyPEM": pulumi.String(certs.issuerKeyPEM),
+						"crtPEM": issuerCert.CertPem,
+						"keyPEM": issuerKey.PrivateKeyPem,
 					},
 				},
 			},
